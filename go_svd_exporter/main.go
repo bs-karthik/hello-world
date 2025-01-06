@@ -5,12 +5,14 @@ replicationState - 1 -Ready, 2 retry , 3- Waiting, 4- Binding, 5- Connecting, 6 
 replicationIsQuiesced - 0 - False, 1 - True
 */
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/go-ldap/ldap/v3"
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,18 +27,25 @@ const (
 	REPLICA_FILTER = "(&(objectClass=ibm-replicationagreement)(ibm-replicationLastChangeId=*))"
 )
 
-// (&(objectclass=ibm-repl*nt)(objectClass=ibm-replicationagreement))
-var MONITOR_ATTRS = []string{"available_workers", "bindscompleted", "bindsrequested", "livethreads",
-	"currentconnections", "largest_workqueue_size", "maxconnections", "total_ssl_connections",
-	"total_tls_connections", "totalconnections", "deletescompleted", "deletesrequested", "comparescompleted", "comparesrequested",
-	"extopscompleted", "extopsrequested", "modifiescompleted", "modifiesrequested", "modrdnscompleted", "modrdnsrequested",
-	"searchescompleted", "searchesrequested", "unbindcompleted", "unbindsrequested"}
-var REPLICA_ATTRS = []string{"ibm-replicationFailedChangeCount", "entryDN", "ibm-replicationPendingChangeCount",
-	"ibm-replicationState", "ibm-replicationLastActivationTime", "ibm-replicationIsQuiesced", "ibm-replicationLastChangeId", "ibm-replicaconsumerid"}
-
-var ldapURL = getLDAPHost()                  //"ldap://localhost:30389"       //os.Getenv("LDAP_HOST")
-var ldapBindDN = os.Getenv("LDAP_BINDDN")    //"cn=isvaadmin,CN=IBMPOLICIES" //os.Getenv("LDAP_BINDDN")
-var ldapPassword = os.Getenv("LDAP_BINDPWD") //"sss"                 //os.Getenv("LDAP_BINDPWD")
+var (
+	MONITOR_ATTRS = []string{
+		"available_workers", "bindscompleted", "bindsrequested", "livethreads",
+		"currentconnections", "largest_workqueue_size", "maxconnections", "total_ssl_connections",
+		"total_tls_connections", "totalconnections", "deletescompleted", "deletesrequested",
+		"comparescompleted", "comparesrequested", "extopscompleted", "extopsrequested",
+		"modifiescompleted", "modifiesrequested", "modrdnscompleted", "modrdnsrequested",
+		"searchescompleted", "searchesrequested", "unbindcompleted", "unbindsrequested",
+	}
+	REPLICA_ATTRS = []string{
+		"ibm-replicationFailedChangeCount", "entryDN", "ibm-replicationPendingChangeCount",
+		"ibm-replicationState", "ibm-replicationLastActivationTime", "ibm-replicationIsQuiesced",
+		"ibm-replicationLastChangeId", "ibm-replicaconsumerid",
+	}
+	ldapURL      = getLDAPHost()
+	ldapBindDN   = os.Getenv("LDAP_BINDDN")
+	ldapPassword = os.Getenv("LDAP_BINDPWD")
+	ldapConnPool *sync.Pool
+)
 
 // LdapMetricsCollector collects LDAP metrics.
 type LdapMetricsCollector struct {
@@ -44,11 +53,54 @@ type LdapMetricsCollector struct {
 	replicationMetric *prometheus.Desc
 }
 
-func getSVDConnection() (*ldap.Conn, error) {
-	conn, err := ldap.DialURL(ldapURL)
+func init() {
+	ldapConnPool = &sync.Pool{
+		New: func() interface{} {
+			conn, err := connectLDAP()
+			if err != nil {
+				log.Fatalf("Failed to create LDAP connection: %v", err)
+			}
+			return conn
+		},
+	}
+}
 
-	err = conn.Bind(ldapBindDN, ldapPassword)
-	return conn, err
+func connectLDAP() (*ldap.Conn, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true, // For testing; set to false in production
+	}
+	conn, err := ldap.DialURL(ldapURL, ldap.DialWithTLSConfig(tlsConfig))
+	//conn, err := ldap.DialURL(ldapURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to LDAP on %s : %w", ldapURL, err)
+	}
+
+	if err := conn.Bind(ldapBindDN, ldapPassword); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to bind to LDAP: %w", err)
+	}
+	log.Printf("Connected to LDAP %s using %s ", ldapURL, ldapBindDN)
+	return conn, nil
+}
+func getLDAPConnection() (*ldap.Conn, error) {
+	conn := ldapConnPool.Get().(*ldap.Conn)
+	if conn.IsClosing() {
+		newConn, err := connectLDAP()
+		if err != nil {
+			return nil, err
+		}
+		return newConn, nil
+	}
+	return conn, nil
+}
+
+func releaseLDAPConnection(conn *ldap.Conn) {
+	if conn.IsClosing() {
+		log.Println("Releasing LDAP Connection to Pool")
+		conn.Close()
+	} else {
+		ldapConnPool.Put(conn)
+	}
 }
 
 // NewLdapMetricsCollector creates a new LdapMetricsCollector.
@@ -70,73 +122,89 @@ func SVDMetricsCollector() *LdapMetricsCollector {
 // Describe sends metric descriptions to the Prometheus channel.
 func (collector *LdapMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- collector.monitorMetric
+	ch <- collector.replicationMetric
 }
 
 // Collect performs the LDAP search and sends metrics to the Prometheus channel.
 func (collector *LdapMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	log.Printf("Connect to ldap to retrieve metrics ")
-	conn, err := getSVDConnection()
-	defer conn.Close()
+	var wg sync.WaitGroup
+
+	conn, err := getLDAPConnection()
 	if err != nil {
-		log.Printf("Failed to connect to LDAP: %v", err)
+		log.Printf("Error: %v", err)
 		return
 	}
-	getCNMonitorMetrics(conn, collector, ch)
-	getReplicationDetails(conn, collector, ch, "DC=SYSTEMONE.COM")
-	getReplicationDetails(conn, collector, ch, "SECAUTHORITY=DEFAULT")
-	getReplicationDetails(conn, collector, ch, "CN=IBMPOLICIES")
+	defer releaseLDAPConnection(conn)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		collector.collectMonitorMetrics(conn, ch)
+	}()
+
+	suffixes := []string{"DC=SYSTEMONE.COM", "SECAUTHORITY=DEFAULT", "CN=IBMPOLICIES"}
+	for _, suffix := range suffixes {
+		wg.Add(1)
+		go func(suffix string) {
+			defer wg.Done()
+			collector.collectReplicationMetrics(conn, ch, suffix)
+		}(suffix)
+	}
+
+	wg.Wait()
 }
 
-func getReplicationDetails(conn *ldap.Conn, collector *LdapMetricsCollector, ch chan<- prometheus.Metric, suffix string) {
-	searchRequest := ldap.NewSearchRequest(suffix, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, REPLICA_FILTER, REPLICA_ATTRS, nil)
+func (collector *LdapMetricsCollector) collectMonitorMetrics(conn *ldap.Conn, ch chan<- prometheus.Metric) {
+	searchRequest := ldap.NewSearchRequest(
+		MONITOR_OU, ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 0, false, MONITOR_FILTER, MONITOR_ATTRS, nil,
+	)
 	searchResult, err := conn.Search(searchRequest)
 	if err != nil {
-		log.Printf("LDAP search failed: %v", err)
+		log.Printf("Failed to search cn=monitor: %v", err)
 		return
 	}
-
-	log.Printf("Search Result replication entries for %s  %s ", suffix, len(searchResult.Entries))
 	for _, entry := range searchResult.Entries {
-		//log.Printf("Attribute length for %s %d ", suffix, len(entry.Attributes))
-		if entry.GetAttributeValue("ibm-replicationLastChangeId") != "" {
-			replChangeID := getFloatValue(entry.GetAttributeValue("ibm-replicationLastChangeId"))
-			replPendingCount := getFloatValue(entry.GetAttributeValue("ibm-replicationPendingChangeCount"))
-			replFailedCount := getFloatValue(entry.GetAttributeValue("ibm-replicationFailedChangeCount"))
-			replState := getReplErrorState(entry.GetAttributeValue("ibm-replicationState"))
-			replIsQuiesced := getBooleanValue(entry.GetAttributeValue("ibm-replicationIsQuiesced"))
-			replConsumerID := entry.GetAttributeValue("ibm-replicaconsumerid")
-			ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, float64(replState), replConsumerID, suffix, "replicationState")
-			ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, float64(replIsQuiesced), replConsumerID, suffix, "replicationIsQuiesced")
-			ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, replChangeID, replConsumerID, suffix, "replicationLastChangeId")
-			ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, replPendingCount, replConsumerID, suffix, "replicationPendingChangeCount")
-			ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, replFailedCount, replConsumerID, suffix, "replicationFailedChangeCount")
-		} else { //
-			log.Printf("No Replication attributes missing for the suffix %s ", suffix)
-			return
-			// ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, -99999, "", suffix, "replicationState")
-			// ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, -99999, "", suffix, "replicationIsQuiesced")
-			// ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, -99999, "", suffix, "replicationLastChangeId")
-			// ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, -99999, "", suffix, "replicationPendingChangeCount")
-			// ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, -99999, "", suffix, "replicationFailedChangeCount")
+		for _, attr := range entry.Attributes {
+			for _, value := range attr.Values {
+				floatValue, err := strconv.ParseFloat(value, 64)
+				if err != nil {
+					log.Printf("Failed to parse attribute %s value: %v", attr.Name, err)
+					continue
+				}
+				ch <- prometheus.MustNewConstMetric(collector.monitorMetric, prometheus.GaugeValue, floatValue, attr.Name)
+			}
 		}
 	}
 }
-func getBooleanValue(value string) int {
-	retValue := 0
-	if strings.EqualFold(value, "TRUE") {
-		retValue = 1
-	}
-	return retValue
-}
-func getFloatValue(value string) float64 {
-	floatValue, err := strconv.ParseFloat(value, 64)
+func (collector *LdapMetricsCollector) collectReplicationMetrics(conn *ldap.Conn, ch chan<- prometheus.Metric, suffix string) {
+	searchRequest := ldap.NewSearchRequest(
+		suffix, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false, REPLICA_FILTER, REPLICA_ATTRS, nil,
+	)
+	searchResult, err := conn.Search(searchRequest)
 	if err != nil {
-		floatValue = -99999
+		log.Printf("Failed to search replication details for %s: %v", suffix, err)
+		return
 	}
-	return floatValue
+	for _, entry := range searchResult.Entries {
+		if entry.GetAttributeValue("ibm-replicationLastChangeId") == "" {
+			//log.Printf("No replication attributes for suffix %s", suffix)
+			continue
+		}
+		replMetrics := map[string]float64{
+			"replicationState":             float64(getReplicationState(entry.GetAttributeValue("ibm-replicationState"))),
+			"replicationIsQuiesced":        float64(getBooleanValue(entry.GetAttributeValue("ibm-replicationIsQuiesced"))),
+			"replicationLastChangeId":      getFloatValue(entry.GetAttributeValue("ibm-replicationLastChangeId")),
+			"replicationPendingCount":      getFloatValue(entry.GetAttributeValue("ibm-replicationPendingChangeCount")),
+			"replicationFailedChangeCount": getFloatValue(entry.GetAttributeValue("ibm-replicationFailedChangeCount")),
+		}
+		consumerID := entry.GetAttributeValue("ibm-replicaconsumerid")
+		for attr, value := range replMetrics {
+			ch <- prometheus.MustNewConstMetric(collector.replicationMetric, prometheus.GaugeValue, value, consumerID, suffix, attr)
+		}
+	}
 }
-func getReplErrorState(state string) int {
-	//log.Printf("Attrs %s", state)
+func getReplicationState(state string) int {
 	switch state {
 	case "ready":
 		return 1
@@ -157,34 +225,26 @@ func getReplErrorState(state string) int {
 	}
 }
 
-func getCNMonitorMetrics(conn *ldap.Conn, collector *LdapMetricsCollector, ch chan<- prometheus.Metric) {
-	// Search CN=Monitor OU for metrics
-	searchRequest := ldap.NewSearchRequest(MONITOR_OU, ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 0, false, MONITOR_FILTER, MONITOR_ATTRS, nil)
-	searchResult, err := conn.Search(searchRequest)
-	if err != nil {
-		log.Printf("LDAP search failed: %v", err)
-		return
+func getBooleanValue(value string) int {
+	retValue := 0
+	if strings.EqualFold(value, "TRUE") {
+		retValue = 1
 	}
-	for _, entry := range searchResult.Entries {
-		for _, attr := range entry.Attributes {
-			for _, value := range attr.Values {
-				// Convert value to float if possible
-				floatValue, err := strconv.ParseFloat(value, 64)
-				if err != nil {
-					log.Printf("Failed to parse value for attribute %s: %v", attr.Name, err)
-					continue
-				}
-				// Send the metric to Prometheus
-				ch <- prometheus.MustNewConstMetric(collector.monitorMetric, prometheus.GaugeValue, floatValue, attr.Name)
-			}
-		}
-	}
+	return retValue
 }
+func getFloatValue(value string) float64 {
+	floatValue, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		floatValue = -99999
+	}
+	return floatValue
+}
+
 func getLDAPHost() string {
 	ldapURL := os.Getenv("LDAP_HOST")
 	if ldapURL == "" {
 		hostname, _ := os.Hostname()
-		ldapURL = fmt.Sprintf("ldap://%s:9389", hostname)
+		ldapURL = fmt.Sprintf("ldaps://%s:9636", hostname)
 	}
 	return ldapURL
 }
